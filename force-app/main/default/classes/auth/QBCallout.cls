@@ -125,5 +125,15 @@ public class QBCallout {
         return QBTermJSON.parse(res.getBody()); 
     }
 
+    public static QBCustomerJSON queryCustomerByName(String name){
+        String query = 'select * from customer where CompanyName = \'' + String.escapeSingleQuotes(name) + '\'';
+        HttpResponse res = calloutHelper('query', 'POST', query);
+        return QBCustomerJSON.parse(res.getBody());
+    }
+
+    public static QBPaymentResponseJSON createPayment(String paymentJson){
+        HttpResponse res = calloutHelper('payment', 'POST', paymentJson);
+        return QBPaymentResponseJSON.parse(res.getBody());
+    }
 
 }

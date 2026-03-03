@@ -441,4 +441,140 @@ public class QBMap {
         return terms; 
     }
 
+    /**
+     * Sync SF Account as QB Customer (bi-directional). Creates in QB if not found, updates if found.
+     * @param acc The Salesforce Account to sync
+     * @return The QB Customer ID
+     */
+    public static String syncCustomer(Account acc){
+        // Ensure qime__QB_ID__c is set if QuickBooks_Customer_Id__c already has a value
+        if(String.isBlank(acc.qime__QB_ID__c) && String.isNotBlank(acc.QuickBooks_Customer_Id__c)){
+            acc.qime__QB_ID__c = acc.QuickBooks_Customer_Id__c;
+        }
+
+        // If no QB ID yet, check QB by company name first
+        if(String.isBlank(acc.QuickBooks_Customer_Id__c)){
+            QBCustomerJSON existingCustomers = QBCallout.queryCustomerByName(acc.Name);
+            if(existingCustomers?.QueryResponse?.Customer != null 
+                && existingCustomers.QueryResponse.Customer.size() > 0){
+                String qbId = existingCustomers.QueryResponse.Customer[0].Id;
+                acc.QuickBooks_Customer_Id__c = qbId;
+                acc.qime__QB_ID__c = qbId;
+                acc.qime__QB_SyncToken__c = existingCustomers.QueryResponse.Customer[0].SyncToken;
+                update acc;
+                return qbId;
+            }
+        }
+
+        // Create or update the customer in QB
+        QBCustomerResponseJSON response = QBCallout.createCustomer(mapAccountData(acc));
+        if(response?.Customer?.Id != null){
+            acc.QuickBooks_Customer_Id__c = response.Customer.Id;
+            acc.qime__QB_ID__c = response.Customer.Id;
+            if(response.Customer.SyncToken != null){
+                acc.qime__QB_SyncToken__c = response.Customer.SyncToken;
+            }
+            update acc;
+            return response.Customer.Id;
+        }
+        return acc.QuickBooks_Customer_Id__c;
+    }
+
+    /**
+     * Map an Opportunity to a QB Invoice JSON string with conditional line items
+     * based on the Opportunity Record Type and optional PAC / Discount amounts.
+     * @param opp The Opportunity record (must include RecordType.Name, Amount, PAC_Amount__c, QuickBooks_Discount_Amount__c, QuickBooks_Invoice__c)
+     * @param customerId The QB Customer ID to use for the invoice
+     * @return JSON string for the QB invoice body
+     */
+    public static String mapOpportunityInvoice(Opportunity opp, String customerId){
+        QBInvoiceJSON invoiceObj = new QBInvoiceJSON();
+        invoiceObj.AutoDocNumber = True;
+        invoiceObj.EmailStatus = 'NotSet';
+
+        if(String.isNotBlank(opp.QuickBooks_Invoice__c)){
+            invoiceObj.DocNumber = opp.QuickBooks_Invoice__c;
+            invoiceObj.AutoDocNumber = False;
+        }
+
+        QBInvoiceJSON.CustomerRef customerRef = new QBInvoiceJSON.CustomerRef();
+        customerRef.value = customerId;
+        invoiceObj.CustomerRef = customerRef;
+
+        invoiceObj.Line = new List<QBInvoiceJSON.Line>();
+
+        // Load all product/service mappings upfront
+        Map<String, String> productIdMap = new Map<String, String>();
+        for(QB_Product_Service_Mapping__mdt mapping : [SELECT DeveloperName, QB_Product_Id__c FROM QB_Product_Service_Mapping__mdt]){
+            productIdMap.put(mapping.DeveloperName, mapping.QB_Product_Id__c);
+        }
+
+        // Line Item 1 - Primary product based on Record Type
+        String recordTypeName = opp?.RecordType?.Name;
+        String primaryProductId;
+        if(recordTypeName == 'New Membership Opportunities'){
+            primaryProductId = productIdMap.get('New_Membership');
+        } else if(recordTypeName == 'Membership Recurring Renewal Opportunities'){
+            primaryProductId = productIdMap.get('Renewal_Membership');
+        }
+
+        if(String.isNotBlank(primaryProductId) && opp.Amount != null){
+            invoiceObj.Line.add(buildLineItem(primaryProductId, opp.Amount));
+        }
+
+        // Line Item 2 - PAC (optional)
+        if(opp.PAC_Amount__c != null && productIdMap.containsKey('PAC')){
+            invoiceObj.Line.add(buildLineItem(productIdMap.get('PAC'), opp.PAC_Amount__c));
+        }
+
+        // Line Item 3 - Discount (optional)
+        if(opp.QuickBooks_Discount_Amount__c != null && productIdMap.containsKey('Membership_Discount')){
+            invoiceObj.Line.add(buildLineItem(productIdMap.get('Membership_Discount'), opp.QuickBooks_Discount_Amount__c));
+        }
+
+        return JSON.serialize(invoiceObj, True);
+    }
+
+    private static QBInvoiceJSON.Line buildLineItem(String productId, Decimal amount){
+        QBInvoiceJSON.Line line = new QBInvoiceJSON.Line();
+        line.Amount = amount;
+        line.DetailType = 'SalesItemLineDetail';
+        QBInvoiceJSON.SalesItemLineDetail detail = new QBInvoiceJSON.SalesItemLineDetail();
+        QBInvoiceJSON.ItemRef itemRef = new QBInvoiceJSON.ItemRef();
+        itemRef.value = productId;
+        detail.ItemRef = itemRef;
+        detail.Qty = 1.0;
+        detail.UnitPrice = amount;
+        detail.TaxCodeRef = new QBInvoiceJSON.ItemRef();
+        detail.TaxCodeRef.value = 'NON';
+        line.SalesItemLineDetail = detail;
+        return line;
+    }
+
+    /**
+     * Build the QB Payment JSON string for a payment linked to a given invoice.
+     * @param customerId The QB Customer ID
+     * @param invoiceId The QB Invoice ID to link to
+     * @param amount The total payment amount
+     * @return JSON string for the QB payment body
+     */
+    public static String mapPaymentForInvoice(String customerId, String invoiceId, Decimal amount){
+        Map<String, Object> paymentObj = new Map<String, Object>();
+        Map<String, Object> customerRef = new Map<String, Object>();
+        customerRef.put('value', customerId);
+        paymentObj.put('CustomerRef', customerRef);
+        paymentObj.put('TotalAmt', amount);
+
+        Map<String, Object> linkedLine = new Map<String, Object>();
+        linkedLine.put('Amount', amount);
+        Map<String, Object> linkedTxn = new Map<String, Object>();
+        linkedTxn.put('TxnId', invoiceId);
+        linkedTxn.put('TxnType', 'Invoice');
+        linkedLine.put('LinkedTxn', new List<Object>{ linkedTxn });
+
+        paymentObj.put('Line', new List<Object>{ linkedLine });
+
+        return JSON.serialize(paymentObj, True);
+    }
+
 }
